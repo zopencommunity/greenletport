@@ -70,7 +70,17 @@ export ZOPEN_BUILD_SYSTEM="Python"
 
 # The extension is C++ and is built per interpreter, so unlike a pure-Python
 # port this produces one wheel per ABI (cp312, cp313, cp314).
-export ZOPEN_COMP="clang"
+#
+# ZOPEN_COMP is still "skip": setup.py drives the compiler itself through
+# sysconfig, and the flags it picks up are the ones this extension needs.
+# Naming a compiler here only makes zopen-build generate and compile its zoslib
+# environment hooks, which this port has no use for and which fails with the
+# compiler unset:
+#
+#   -DPATH_MAX=1024: eval: ... FSUM7351 not found
+#   ***ERROR: Compiler command for zoslib_env_hook.c failed to compile
+export ZOPEN_COMP="skip"
+export ZOPEN_CONFIGURE="skip"
 
 zopen_get_version() {
   echo "${GREENLET_VERSION}"
