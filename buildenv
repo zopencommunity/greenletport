@@ -246,33 +246,42 @@ for name, body in SCENARIOS:
         print("FAIL: %s -- rc=%s %s" % (name, proc.returncode, detail))
         failed += 1
 
-# Report the state of the known-broken modules without counting them. pytest
-# is already installed by the check phase; if it is not available, say so
-# rather than silently reporting nothing.
-try:
-    import pytest  # noqa: F401
-    have_pytest = True
-except ImportError:
-    have_pytest = False
+# Report the state of the known-broken modules without counting them.
+#
+# unittest rather than pytest: pytest has to collect through --pyargs, which in
+# this venv resolves to a tests package it cannot import, and every module then
+# came back as "rc=4, no tests ran". Reporting that as KILLED would be a lie of
+# exactly the kind this port is trying not to tell -- it means "could not run",
+# not "died". The three states are kept apart below.
+ran_none = 0
+for mod in KNOWN_BROKEN_MODULES:
+    proc = subprocess.run(
+        [sys.executable, "-m", "unittest", "greenlet.tests." + mod, "-v"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = proc.stdout.decode("latin-1", "replace")
+    tail = out.strip().splitlines()
+    tail = tail[-1] if tail else "(no output)"
+    rc = proc.returncode
+    if rc in (0, 1):
+        # 0 = all passed, 1 = test failures. Either way the process survived,
+        # which is the thing being measured here.
+        state = "survived"
+    elif "Ran 0 tests" in out or "ModuleNotFound" in out or "Error" in out[:200]:
+        state = "could-not-run"
+        ran_none += 1
+    else:
+        state = "KILLED"
+        known_broken_failed += 1
+    print("KNOWN-ISSUE: %-26s %-14s rc=%-5s %s"
+          % (mod, state, rc, tail[:60]))
 
-if have_pytest:
-    for mod in KNOWN_BROKEN_MODULES:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "--pyargs", "greenlet.tests." + mod,
-             "-q", "--no-header", "-p", "no:cacheprovider"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        tail = proc.stdout.decode("latin-1", "replace").strip().splitlines()
-        tail = tail[-1] if tail else "(no output)"
-        state = "survived" if proc.returncode in (0, 1) else "KILLED"
-        print("KNOWN-ISSUE: %-26s %-9s rc=%-4s %s"
-              % (mod, state, proc.returncode, tail[:70]))
-        known_broken_failed += 0 if proc.returncode in (0, 1) else 1
-    if known_broken_failed == 0:
-        print("KNOWN-ISSUE: every module that used to be killed survived this "
-              "run. That may mean the defect is fixed, or only that the frames "
-              "landed differently. Re-run the full suite before believing it.")
-else:
-    print("KNOWN-ISSUE: pytest unavailable; the known-broken modules were not run")
+if known_broken_failed == 0 and ran_none == 0:
+    print("KNOWN-ISSUE: every module that used to be killed survived this run. "
+          "That may mean the defect is fixed, or only that the frames landed "
+          "differently. Re-run the full suite before believing it.")
+elif ran_none:
+    print("KNOWN-ISSUE: %d module(s) could not be run at all, so this build "
+          "says nothing about them" % ran_none)
 
 import greenlet
 print("greenlet %s on Python %s -- %d passed, %d failed, %d module(s) killed"
