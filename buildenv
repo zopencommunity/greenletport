@@ -208,21 +208,24 @@ SCENARIOS = [
      "    seen.append(g.switch())\n"
      "assert seen[:50] == list(range(50)), seen[:5]"),
 
-    # The known defect, stated as a scenario so its status is on every build.
-    # A deep C call between a switch and a throw kills the process; the same
-    # code with a fast-path operation in the middle is clean. This is expected
-    # to FAIL until the defect is fixed -- see the README.
-    ("KNOWN-BROKEN: a deep C call between switch and throw",
-     "def f():\n"
-     "    try:\n"
-     "        switch('ok')\n"
-     "    except RuntimeError:\n"
-     "        switch('ok'); return\n"
-     "    switch('fail')\n"
-     "g = G(f)\n"
-     "r1 = g.switch()\n"
-     "str(1)                      # any deep C call: str/int/dict/isinstance\n"
-     "assert g.throw(RuntimeError) == 'ok'"),
+]
+
+# The outstanding defect is NOT probed with a hand-written micro-scenario.
+# One was tried and it is not a reliable detector: whether any particular
+# sequence dies depends on where its frames happen to land, so the same few
+# lines pass in one build and kill the process in the next. Reporting such a
+# scenario as PASS would read as "the defect is fixed" when nothing had changed.
+#
+# greenlet's own suite is the honest probe, so the modules known to die are run
+# here -- each in its own process, since that is the only way to survive them --
+# and reported without being counted. The set that fails shifts between builds
+# for the same reason, which is itself the thing to watch.
+KNOWN_BROKEN_MODULES = [
+    "test_greenlet",
+    "test_throw",
+    "test_tracing",
+    "test_greenlet_trash",
+    "test_extension_interface",
 ]
 
 passed = 0
@@ -237,22 +240,42 @@ for name, body in SCENARIOS:
     if ok:
         print("PASS: %s" % name)
         passed += 1
-        if name.startswith("KNOWN-BROKEN"):
-            print("      NOTE: this is the documented defect and it now PASSES."
-                  " Re-run greenlet's own suite and update the README.")
-    elif name.startswith("KNOWN-BROKEN"):
-        # Not counted: the README explains why the port ships in this state.
-        print("KNOWN-ISSUE: %s -- still failing (rc=%s), as documented"
-              % (name, proc.returncode))
-        known_broken_failed += 1
     else:
         detail = proc.stdout.decode("latin-1", "replace").strip().splitlines()
         detail = detail[-1] if detail else "(no output)"
         print("FAIL: %s -- rc=%s %s" % (name, proc.returncode, detail))
         failed += 1
 
+# Report the state of the known-broken modules without counting them. pytest
+# is already installed by the check phase; if it is not available, say so
+# rather than silently reporting nothing.
+try:
+    import pytest  # noqa: F401
+    have_pytest = True
+except ImportError:
+    have_pytest = False
+
+if have_pytest:
+    for mod in KNOWN_BROKEN_MODULES:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--pyargs", "greenlet.tests." + mod,
+             "-q", "--no-header", "-p", "no:cacheprovider"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        tail = proc.stdout.decode("latin-1", "replace").strip().splitlines()
+        tail = tail[-1] if tail else "(no output)"
+        state = "survived" if proc.returncode in (0, 1) else "KILLED"
+        print("KNOWN-ISSUE: %-26s %-9s rc=%-4s %s"
+              % (mod, state, proc.returncode, tail[:70]))
+        known_broken_failed += 0 if proc.returncode in (0, 1) else 1
+    if known_broken_failed == 0:
+        print("KNOWN-ISSUE: every module that used to be killed survived this "
+              "run. That may mean the defect is fixed, or only that the frames "
+              "landed differently. Re-run the full suite before believing it.")
+else:
+    print("KNOWN-ISSUE: pytest unavailable; the known-broken modules were not run")
+
 import greenlet
-print("greenlet %s on Python %s -- %d passed, %d failed, %d known-broken"
+print("greenlet %s on Python %s -- %d passed, %d failed, %d module(s) killed"
       % (greenlet.__version__, sys.version.split()[0],
          passed, failed, known_broken_failed))
 sys.exit(1 if failed else 0)

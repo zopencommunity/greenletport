@@ -11,60 +11,61 @@
 
 ## What works
 
-Verified on Python 3.12, 3.13 and 3.14:
+Verified on Python 3.12, 3.13 and 3.14, each scenario in its own process:
 
 * greenlets run and return values; `dead` is set correctly
 * control alternates between parent and child in the right order
 * values cross a switch in both directions
 * a 4096-element local survives being saved to the heap and restored
 * exceptions propagate out of a greenlet
-* `throw()` raises inside a suspended greenlet; a bare `throw()` kills it with `GreenletExit`
+* `throw()` raises inside a suspended greenlet
 * greenlets nest
 * 500 consecutive switches are clean
 * producer/consumer patterns work
 
-From greenlet's own suite, these modules pass in full: `test_contextvars` (9),
-`test_gc` (4), `test_generator` (1), `test_generator_nested` (5),
-`test_interpreter_shutdown` (23), `test_leaks` (9), `test_stack_saved` (1),
-`test_weakref` (3).
-
 ## What does not work
 
-Some sequences kill the process — SIGKILL with no dump, or a `CEE3204S` 0C4
-protection exception. The trigger is narrow to describe and wide in practice:
+**The port is unstable, and *which* things fail moves between builds.**
 
-> a **deep C call** between a switch and a subsequent throw.
+That is the single most important thing to know about it. Whether a given
+sequence survives depends on where its frames happen to land, so a reproducer
+that kills one build passes in the next with no source change. In one build
+`test_weakref` and `test_contextvars` passed cleanly; in the next, from the
+same commit, both crashed. Do not read a green run as a fixed port.
+
+A representative run against the installed wheel:
+
+| module | result |
+| --- | --- |
+| `test_gc`, `test_generator`, `test_generator_nested`, `test_leaks`, `test_stack_saved`, `test_version` | pass |
+| `test_interpreter_shutdown` | 21 passed, 2 failed |
+| `test_cpp` | 3 passed, 3 fail — EBCDIC, not greenlet's fault (see below) |
+| `test_greenlet`, `test_throw`, `test_contextvars` | **SIGSEGV** |
+| `test_extension_interface`, `test_greenlet_trash`, `test_tracing`, `test_weakref` | **SIGKILL** |
+
+The failures are process death, not exceptions: SIGKILL with no dump, SIGSEGV,
+or a `CEE3204S` 0C4 protection exception. Nothing is catchable.
+
+One shape that reproduced it often enough to be worth recording is a **deep C
+call between a switch and a subsequent throw**:
 
 ```python
 r1 = g.switch()
-str(1)                      # any deep C call
-g.throw(RuntimeError)       # process dies here
+str(1)                      # str/int/dict/object/isinstance/ctypes
+g.throw(RuntimeError)
 ```
 
-What counts as "deep" is the distinction between operations the CPython eval
-loop handles on its own fast paths and those that go through
-`type.__call__` / `_PyObject_MakeTpCall` or out through libffi:
+with the split following CPython's eval-loop fast paths — `len()`, `"a"+"b"`,
+`list(range(3))` and `sorted()` were harmless where `str(1)`, `int("1")`,
+`dict(a=1)`, `object()`, `isinstance()` and any `ctypes` call were not. But
+this is a *symptom*, not the defect, and it is layout-sensitive like everything
+else: the port's own build survives that exact snippet while still crashing
+seven of greenlet's test modules. The port therefore does not use it as a
+health check; it runs the real modules instead.
 
-| dies | survives |
-| --- | --- |
-| `str(1)`, `int("1")`, `dict(a=1)`, `object()` | `len("abc")`, `"a"+"b"` |
-| `isinstance(x, T)` (`PyType_IsSubtype`) | `list(range(3))`, `sorted([3,1,2])` |
-| any `ctypes` call | a 1000-element list comprehension |
-| `unittest`'s `assertEqual` / `assertTrue` | bare `assert` |
-
-This is not a corner case. `isinstance()` after a `throw()` is enough, and that
-is ordinary code — the port's own first check phase died on exactly that, at
-`PyType_IsSubtype`, reporting nothing for any interpreter. The check is now
-structured so each behaviour runs in its own subprocess and one crash cannot
-hide the rest.
-
-Modules of greenlet's own suite that die: `test_greenlet` (the main suite),
-`test_throw`, `test_tracing`, `test_greenlet_trash` (SIGKILL) and
-`test_extension_interface` (SIGSEGV).
-
-Two further modules fail for reasons that are **not** greenlet's fault:
-`test_cpp` decodes subprocess output as UTF-8 when on z/OS it is EBCDIC, and
-`test_version` looks for source files relative to a layout this build does not
+`test_cpp` and `test_version` fail for reasons that are **not** greenlet's
+fault: the first decodes subprocess output as UTF-8 when on z/OS it is EBCDIC,
+the second looks for source files relative to a layout this build does not
 have.
 
 Anything built on greenlet — gevent, SQLAlchemy's async support — should be
@@ -181,7 +182,18 @@ Things ruled out for the remaining crash, with evidence:
   Python call, which is why 64 levels of Python recursion between the switch
   and the throw are harmless while a single `str(1)` is not.
 
-The failure is a SIGKILL with no CEEDUMP, which means it is not an LE abend.
+The failure is usually a SIGKILL with no CEEDUMP, which means it is not an LE
+abend; it also appears as SIGSEGV and as a `CEE3204S` 0C4 depending on the
+build.
+
+The most useful remaining clue is that the fix in place is **incomplete rather
+than wrong**. The guard removed one frame overlap — the one that made
+`slp_restore_state()` clobber its own return address — and that took the port
+from "cannot switch at all" to "switches correctly thousands of times". What is
+left behaves like a second overlap that the guard does not cover, which would
+explain both the layout sensitivity and why the surviving set moves between
+builds. Anyone picking this up should start by mapping, for a crashing case,
+exactly which live frame the restore is writing over.
 
 ## Building
 
