@@ -1,0 +1,152 @@
+diff --git a/src/greenlet/TThreadStateDestroy.cpp b/src/greenlet/TThreadStateDestroy.cpp
+index 5562a73..bdcc982 100644
+--- a/src/greenlet/TThreadStateDestroy.cpp
++++ b/src/greenlet/TThreadStateDestroy.cpp
+@@ -211,7 +211,56 @@ private:
+ // in contrast, static volatile variables are at some pre-computed
+ // offset.
+ typedef greenlet::ThreadStateCreator<greenlet::ThreadState_DestroyNoGIL::MarkGreenletDeadAndQueueCleanup> ThreadStateCreator;
++#if defined(__MVS__)
++/* z/OS has no thread-local storage of any kind: the compiler rejects
++   thread_local, _Thread_local and __thread alike with
++
++     error: thread-local storage is not supported for the current target
++
++   so greenlet's one thread-local is expressed with a pthread key instead.
++   The semantics that matter are preserved: the object is created on first
++   use in each thread and destroyed when that thread exits, which is exactly
++   what a key destructor provides. Everything reaches it through
++   GET_THREAD_STATE(), so this is the only place that has to know. */
++#include <pthread.h>
++
++static pthread_key_t g_thread_state_key;
++static pthread_once_t g_thread_state_once = PTHREAD_ONCE_INIT;
++
++extern "C" {
++static void
++g_thread_state_destroy(void* p)
++{
++    delete static_cast<ThreadStateCreator*>(p);
++}
++static void
++g_thread_state_key_init(void)
++{
++    if (pthread_key_create(&g_thread_state_key, g_thread_state_destroy) != 0) {
++        Py_FatalError("greenlet: could not create the thread state key");
++    }
++}
++}
++
++static ThreadStateCreator&
++g_thread_state_get(void)
++{
++    pthread_once(&g_thread_state_once, g_thread_state_key_init);
++    void* p = pthread_getspecific(g_thread_state_key);
++    if (p == NULL) {
++        ThreadStateCreator* created = new ThreadStateCreator();
++        if (pthread_setspecific(g_thread_state_key, created) != 0) {
++            delete created;
++            Py_FatalError("greenlet: could not set the thread state");
++        }
++        p = created;
++    }
++    return *static_cast<ThreadStateCreator*>(p);
++}
++#define GET_THREAD_STATE() g_thread_state_get()
++#else
+ static thread_local ThreadStateCreator g_thread_state_global;
+ #define GET_THREAD_STATE() g_thread_state_global
++#endif
+ 
+ #endif //T_THREADSTATE_DESTROY
+diff --git a/src/greenlet/platform/switch_zos_s390x.h b/src/greenlet/platform/switch_zos_s390x.h
+new file mode 100644
+index 0000000..1c22cbe
+--- /dev/null
++++ b/src/greenlet/platform/switch_zos_s390x.h
+@@ -0,0 +1,72 @@
++/*
++ * Stack switching for z/OS on s390x, XPLINK linkage.
++ *
++ * This is not the Linux/s390x file with the OS check widened. The two
++ * linkages disagree about nearly everything this code depends on:
++ *
++ *   - The stack pointer is r4, not r15. r15 on z/OS holds something else
++ *     entirely, so the Linux file would capture and adjust a value that has
++ *     nothing to do with the stack.
++ *   - Callee-saved is r6-r15, which the compiler emits as a single
++ *     "stmg 6,15,<off>(4)".
++ *   - The stack grows down but r4 points 2048 bytes below the frame it
++ *     addresses, so every reference to frame storage is a positive
++ *     displacement from r4.
++ *   - The return address is in r7 and a call returns via "b 2(7)".
++ *
++ * The assembler reached through inline asm is HLASM, not gas. Two things
++ * follow: an instruction must not start in column 1, or it is read as a
++ * label -- which fails as "expected identifier" on the first instruction
++ * and then "symbol is already defined" on the second -- and register
++ * operands are bare numbers, so "%0" expands to "4" and not "%r4". Every
++ * instruction below therefore starts with a space and names registers
++ * without a sigil.
++ */
++
++#define STACK_REFPLUS 1
++
++#ifdef SLP_EVAL
++
++/* Conservative: nothing at the top of this frame is excluded from the
++ * saved region. A value too large silently drops part of a live frame
++ * from the copy; too small only copies more than it had to. */
++#define STACK_MAGIC 0
++
++/* The full XPLINK callee-saved set. r4 is deliberately absent: it is the
++ * stack pointer, it is adjusted explicitly below, and listing it as a
++ * clobber would invite the compiler to save and restore it around the very
++ * statement whose purpose is to change it. */
++#define REGS_TO_SAVE "r8", "r9", "r10", "r11", "r12", "r13", \
++                     "r14", "r15", \
++                     "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15"
++
++static int
++slp_switch(void)
++{
++    int ret;
++    long *stackref, stsizediff;
++    __asm__ volatile ("" : : : REGS_TO_SAVE);
++    __asm__ volatile (" lgr %0,4" : "=r" (stackref) : );
++    {
++        SLP_SAVE_STATE(stackref, stsizediff);
++        __asm__ volatile (
++            " agr 4,%0"
++            : /* no outputs */
++            : "r" (stsizediff)
++            );
++        /* Drop the stack pointer clear of the region about to be restored.
++           A callee on this linkage saves its incoming registers into its
++           CALLER frame, 1808 bytes ABOVE the caller stack pointer, so the
++           restore trampoline would otherwise park its own return address
++           inside the very bytes it is about to overwrite. 4096 is chosen to
++           exceed the 2048 bias plus the largest slot (0x818) with margin. */
++        __asm__ volatile (" aghi 4,-4096");
++        SLP_RESTORE_STATE();
++        __asm__ volatile (" aghi 4,4096");
++    }
++    __asm__ volatile ("" : : : REGS_TO_SAVE);
++    __asm__ volatile (" lhi %0,0" : "=r" (ret) : );
++    return ret;
++}
++
++#endif
+diff --git a/src/greenlet/slp_platformselect.h b/src/greenlet/slp_platformselect.h
+index d9b7d0a..fabccda 100644
+--- a/src/greenlet/slp_platformselect.h
++++ b/src/greenlet/slp_platformselect.h
+@@ -39,6 +39,8 @@ extern "C" {
+ # include "platform/switch_amd64_unix.h" /* SunStudio on amd64 */
+ #elif defined(__SUNPRO_C) && defined(__i386__) && defined(sun)
+ # include "platform/switch_x86_unix.h" /* SunStudio on x86 */
++#elif defined(__MVS__) && defined(__s390x__)
++# include "platform/switch_zos_s390x.h" /* z/OS on s390x, XPLINK linkage */
+ #elif defined(__GNUC__) && defined(__s390__) && defined(__linux__)
+ # include "platform/switch_s390_unix.h" /* Linux/S390 */
+ #elif defined(__GNUC__) && defined(__s390x__) && defined(__linux__)
