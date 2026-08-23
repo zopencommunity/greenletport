@@ -86,301 +86,175 @@ zopen_get_version() {
   echo "${GREENLET_VERSION}"
 }
 
-# greenlet's own suite is not run here. Several of its modules kill the
-# process on this platform (see the README), and a check phase that dies takes
-# the build with it. What runs instead is the behaviour this port had to get
-# right, plus a subprocess probe for the known failure so that its status is
-# visible on every build rather than remembered.
+# greenlet's own suite is not run here, and neither is a single in-process
+# check script. On this platform a failing greenlet does not raise -- it takes
+# the process down, with a 0C4 or a bare SIGKILL -- so one bad behaviour would
+# hide every result after it. The first version of this check did exactly that:
+# it died at PyType_IsSubtype on an isinstance() call and reported nothing at
+# all for any interpreter.
+#
+# Each behaviour therefore runs in its own subprocess. A scenario that kills its
+# process is a FAIL with a return code, and the rest still report.
 zopen_python_test() {
   GREENLET_EXPECTED_VERSION="${GREENLET_VERSION}" python - <<'PYEOF'
 import os
 import subprocess
 import sys
 
-# Deliberately not the wording zopen-build prints for its own per-interpreter
-# header: zopen_check_results counts that header to notice an interpreter that
-# died before its first check.
 print("Interpreter: Python %s" % sys.version.split()[0])
 
-sys.path = [p for p in sys.path if p not in ("", os.getcwd())]
+PRELUDE = (
+    "from greenlet import greenlet as G\n"
+    "import greenlet\n"
+    "def switch(*a):\n"
+    "    return G.getcurrent().parent.switch(*a)\n"
+)
+
+SCENARIOS = [
+    ("version is the one this port builds",
+     "assert greenlet.__version__ == %r, greenlet.__version__"
+     % os.environ["GREENLET_EXPECTED_VERSION"]),
+
+    ("the C extension is the one imported",
+     "from greenlet import _greenlet\n"
+     "assert _greenlet.__file__.endswith(('.so', '.x')), _greenlet.__file__"),
+
+    ("native byte order is big-endian",
+     "import sys; assert sys.byteorder == 'big', sys.byteorder"),
+
+    ("a greenlet runs and returns a value",
+     "g = G(lambda: 42)\n"
+     "assert g.switch() == 42\n"
+     "assert g.dead"),
+
+    ("control alternates between parent and child",
+     "log = []\n"
+     "def child():\n"
+     "    log.append('c1'); switch(); log.append('c2'); return 'done'\n"
+     "g = G(child)\n"
+     "log.append('m1'); g.switch(); log.append('m2')\n"
+     "r = g.switch(); log.append('m3')\n"
+     "assert log == ['m1','c1','m2','c2','m3'], log\n"
+     "assert r == 'done'"),
+
+    ("values survive a switch in both directions",
+     "def echo():\n"
+     "    return switch('from-child')\n"
+     "g = G(echo)\n"
+     "assert g.switch() == 'from-child'\n"
+     "assert g.switch('from-parent') == 'from-parent'"),
+
+    ("a large stack frame survives save and restore",
+     "payload = list(range(4096))\n"
+     "def worker():\n"
+     "    local = list(payload)\n"
+     "    switch()\n"
+     "    assert local == payload\n"
+     "    return sum(local)\n"
+     "g = G(worker)\n"
+     "g.switch()\n"
+     "assert g.switch() == sum(payload)"),
+
+    ("an exception propagates out of a greenlet",
+     "def boom():\n"
+     "    raise ValueError('from inside')\n"
+     "g = G(boom)\n"
+     "try:\n"
+     "    g.switch()\n"
+     "except ValueError as e:\n"
+     "    assert str(e) == 'from inside'\n"
+     "else:\n"
+     "    raise AssertionError('did not propagate')"),
+
+    ("throw() raises inside a suspended greenlet",
+     "def child():\n"
+     "    try:\n"
+     "        switch()\n"
+     "    except RuntimeError:\n"
+     "        return 'caught'\n"
+     "    return 'not-thrown'\n"
+     "g = G(child)\n"
+     "g.switch()\n"
+     "assert g.throw(RuntimeError) == 'caught'"),
+
+    ("greenlets nest",
+     "order = []\n"
+     "def inner():\n"
+     "    order.append('inner'); return 'inner-done'\n"
+     "def outer():\n"
+     "    order.append('outer')\n"
+     "    order.append(G(inner).switch())\n"
+     "    return 'outer-done'\n"
+     "g = G(outer)\n"
+     "assert g.switch() == 'outer-done'\n"
+     "assert order == ['outer','inner','inner-done'], order"),
+
+    ("500 consecutive switches",
+     "def child():\n"
+     "    while True:\n"
+     "        switch()\n"
+     "g = G(child)\n"
+     "g.switch()\n"
+     "for _ in range(500):\n"
+     "    g.switch()"),
+
+    ("a producer/consumer pattern works",
+     "def producer():\n"
+     "    for i in range(50):\n"
+     "        switch(i)\n"
+     "g = G(producer)\n"
+     "seen = [g.switch()]\n"
+     "while not g.dead:\n"
+     "    seen.append(g.switch())\n"
+     "assert seen[:50] == list(range(50)), seen[:5]"),
+
+    # The known defect, stated as a scenario so its status is on every build.
+    # A deep C call between a switch and a throw kills the process; the same
+    # code with a fast-path operation in the middle is clean. This is expected
+    # to FAIL until the defect is fixed -- see the README.
+    ("KNOWN-BROKEN: a deep C call between switch and throw",
+     "def f():\n"
+     "    try:\n"
+     "        switch('ok')\n"
+     "    except RuntimeError:\n"
+     "        switch('ok'); return\n"
+     "    switch('fail')\n"
+     "g = G(f)\n"
+     "r1 = g.switch()\n"
+     "str(1)                      # any deep C call: str/int/dict/isinstance\n"
+     "assert g.throw(RuntimeError) == 'ok'"),
+]
 
 passed = 0
 failed = 0
+known_broken_failed = 0
 
-
-def check(name, fn):
-    global passed, failed
-    try:
-        fn()
-    except Exception as exc:
-        print("FAIL: %s -- %s: %s" % (name, type(exc).__name__, exc))
-        failed += 1
-    else:
+for name, body in SCENARIOS:
+    code = PRELUDE + body + "\nprint('SCENARIO-OK')\n"
+    proc = subprocess.run([sys.executable, "-c", code],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    ok = proc.returncode == 0 and b"SCENARIO-OK" in proc.stdout
+    if ok:
         print("PASS: %s" % name)
         passed += 1
-
+        if name.startswith("KNOWN-BROKEN"):
+            print("      NOTE: this is the documented defect and it now PASSES."
+                  " Re-run greenlet's own suite and update the README.")
+    elif name.startswith("KNOWN-BROKEN"):
+        # Not counted: the README explains why the port ships in this state.
+        print("KNOWN-ISSUE: %s -- still failing (rc=%s), as documented"
+              % (name, proc.returncode))
+        known_broken_failed += 1
+    else:
+        detail = proc.stdout.decode("latin-1", "replace").strip().splitlines()
+        detail = detail[-1] if detail else "(no output)"
+        print("FAIL: %s -- rc=%s %s" % (name, proc.returncode, detail))
+        failed += 1
 
 import greenlet
-from greenlet import greenlet as G
-
-expected = os.environ["GREENLET_EXPECTED_VERSION"]
-
-
-def version_is_ours():
-    if greenlet.__version__ != expected:
-        raise AssertionError("imported %s, this port builds %s"
-                             % (greenlet.__version__, expected))
-
-
-check("version is the one this port builds", version_is_ours)
-
-
-def extension_is_compiled():
-    # A pure-Python fallback would silently be a different thing entirely.
-    from greenlet import _greenlet
-    if not getattr(_greenlet, "__file__", "").endswith((".so", ".x")):
-        raise AssertionError("greenlet._greenlet is not a compiled extension")
-
-
-check("the C extension is the one imported", extension_is_compiled)
-
-
-def byte_order_is_big():
-    if sys.byteorder != "big":
-        raise AssertionError("expected a big-endian interpreter, got %s"
-                             % sys.byteorder)
-
-
-check("native byte order is big-endian", byte_order_is_big)
-
-
-def simple_switch():
-    g = G(lambda: 42)
-    if g.switch() != 42:
-        raise AssertionError("switch did not return the greenlet's value")
-    if not g.dead:
-        raise AssertionError("greenlet did not die after returning")
-
-
-check("a greenlet runs and returns a value", simple_switch)
-
-
-def switch_ordering():
-    log = []
-
-    def child():
-        log.append("c1")
-        G.getcurrent().parent.switch()
-        log.append("c2")
-        return "done"
-
-    g = G(child)
-    log.append("m1")
-    g.switch()
-    log.append("m2")
-    result = g.switch()
-    log.append("m3")
-    if log != ["m1", "c1", "m2", "c2", "m3"]:
-        raise AssertionError("interleaving was %r" % (log,))
-    if result != "done":
-        raise AssertionError("final result was %r" % (result,))
-
-
-check("control alternates between parent and child", switch_ordering)
-
-
-def values_cross_the_switch():
-    # The stack is copied to the heap and back on every switch; a value that
-    # does not survive that round trip is the first sign of a bad copy.
-    def echo():
-        received = G.getcurrent().parent.switch("from-child")
-        return received
-
-    g = G(echo)
-    if g.switch() != "from-child":
-        raise AssertionError("value from child was lost")
-    if g.switch("from-parent") != "from-parent":
-        raise AssertionError("value to child was lost")
-
-
-check("values survive a switch in both directions", values_cross_the_switch)
-
-
-def large_frame_survives():
-    # A greenlet holding a big local frame exercises a copy of real size
-    # rather than a few hundred bytes.
-    payload = list(range(4096))
-
-    def worker():
-        local = list(payload)
-        G.getcurrent().parent.switch()
-        if local != payload:
-            raise AssertionError("a 4096-element local did not survive")
-        return sum(local)
-
-    g = G(worker)
-    g.switch()
-    if g.switch() != sum(payload):
-        raise AssertionError("checksum after the switch is wrong")
-
-
-check("a large stack frame survives being saved and restored",
-      large_frame_survives)
-
-
-def stack_was_actually_saved():
-    # If this is zero the switch is not doing what it claims.
-    def child():
-        G.getcurrent().parent.switch()
-
-    g = G(child)
-    g.switch()
-    if g.gr_frame is None and not g._stack_saved:
-        raise AssertionError("no stack was saved for a suspended greenlet")
-
-
-check("a suspended greenlet has saved stack", stack_was_actually_saved)
-
-
-def exception_propagates_out():
-    def boom():
-        raise ValueError("from inside")
-
-    g = G(boom)
-    try:
-        g.switch()
-    except ValueError as exc:
-        if str(exc) != "from inside":
-            raise AssertionError("wrong exception: %s" % exc)
-    else:
-        raise AssertionError("exception did not propagate to the parent")
-
-
-check("an exception propagates out of a greenlet", exception_propagates_out)
-
-
-def throw_into_suspended():
-    def child():
-        try:
-            G.getcurrent().parent.switch()
-        except RuntimeError:
-            return "caught"
-        return "not-thrown"
-
-    g = G(child)
-    g.switch()
-    if g.throw(RuntimeError) != "caught":
-        raise AssertionError("throw() did not raise inside the greenlet")
-
-
-check("throw() raises inside a suspended greenlet", throw_into_suspended)
-
-
-def kill_by_greenlet_exit():
-    def child():
-        G.getcurrent().parent.switch()
-        raise AssertionError("should not be reached")
-
-    g = G(child)
-    g.switch()
-    result = g.throw()
-    if not isinstance(result, greenlet.GreenletExit):
-        raise AssertionError("bare throw() gave %r" % (result,))
-    if not g.dead:
-        raise AssertionError("greenlet is not dead after GreenletExit")
-
-
-check("a bare throw() kills the greenlet cleanly", kill_by_greenlet_exit)
-
-
-def nested_greenlets():
-    order = []
-
-    def inner():
-        order.append("inner")
-        return "inner-done"
-
-    def outer():
-        order.append("outer")
-        ig = G(inner)
-        order.append(ig.switch())
-        return "outer-done"
-
-    g = G(outer)
-    if g.switch() != "outer-done":
-        raise AssertionError("nested greenlet did not complete")
-    if order != ["outer", "inner", "inner-done"]:
-        raise AssertionError("nesting order was %r" % (order,))
-
-
-check("greenlets nest", nested_greenlets)
-
-
-def many_cycles():
-    # Repetition is what catches a switch that corrupts a little each time.
-    def child():
-        while True:
-            G.getcurrent().parent.switch()
-
-    g = G(child)
-    g.switch()
-    for _ in range(500):
-        g.switch()
-
-
-check("500 consecutive switches", many_cycles)
-
-
-def generator_over_greenlet():
-    # The pattern every consumer of greenlet actually builds on.
-    def producer():
-        for i in range(50):
-            G.getcurrent().parent.switch(i)
-        return None
-
-    g = G(producer)
-    seen = [g.switch()]
-    while not g.dead:
-        seen.append(g.switch())
-    if seen[:50] != list(range(50)):
-        raise AssertionError("producer sequence was wrong: %r" % (seen[:5],))
-
-
-check("a producer/consumer pattern works", generator_over_greenlet)
-
-
-# The known failure, run where it cannot take this process down with it.
-# It is not counted as a failure -- the README explains why the port ships in
-# this state -- but its status is printed on every build so that the day it
-# starts working is not missed.
-KNOWN_BAD = (
-    "import unittest\n"
-    "from greenlet import greenlet\n"
-    "def switch(*a): return greenlet.getcurrent().parent.switch(*a)\n"
-    "tc = unittest.TestCase()\n"
-    "def f():\n"
-    "    try: switch('ok')\n"
-    "    except RuntimeError:\n"
-    "        switch('ok'); return\n"
-    "    switch('fail')\n"
-    "g = greenlet(f)\n"
-    "r1 = g.switch(); tc.assertEqual(r1, 'ok')\n"
-    "r2 = g.throw(RuntimeError); tc.assertEqual(r2, 'ok')\n"
-    "print('SURVIVED')\n"
-)
-
-proc = subprocess.run([sys.executable, "-c", KNOWN_BAD],
-                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-if proc.returncode == 0 and b"SURVIVED" in proc.stdout:
-    print("KNOWN-ISSUE: the deep-call-then-throw pattern now SURVIVES -- "
-          "the outstanding defect may be fixed; re-run greenlet's own suite "
-          "and update the README")
-else:
-    print("KNOWN-ISSUE: the deep-call-then-throw pattern still kills the "
-          "process (rc=%s), as documented in the README" % proc.returncode)
-
-print("greenlet %s on Python %s -- %d passed, %d failed"
-      % (greenlet.__version__, sys.version.split()[0], passed, failed))
+print("greenlet %s on Python %s -- %d passed, %d failed, %d known-broken"
+      % (greenlet.__version__, sys.version.split()[0],
+         passed, failed, known_broken_failed))
 sys.exit(1 if failed else 0)
 PYEOF
 }

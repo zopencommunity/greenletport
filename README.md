@@ -30,22 +30,37 @@ From greenlet's own suite, these modules pass in full: `test_contextvars` (9),
 
 ## What does not work
 
-Some sequences kill the process. The smallest reproducer found:
+Some sequences kill the process — SIGKILL with no dump, or a `CEE3204S` 0C4
+protection exception. The trigger is narrow to describe and wide in practice:
+
+> a **deep C call** between a switch and a subsequent throw.
 
 ```python
-g.switch()
-unittest.TestCase().assertEqual(r, "ok")   # any deep-ish Python call
-g.throw(RuntimeError)                      # process dies here
+r1 = g.switch()
+str(1)                      # any deep C call
+g.throw(RuntimeError)       # process dies here
 ```
 
-Replace the middle line with a bare `assert`, or with a shallow function call,
-and it passes — so it is the *depth of the intervening call*, not the throw.
-Recursing 160 frames deep after a throw is fine; 500 consecutive switch/throw
-cycles are fine. Only the combination fails.
+What counts as "deep" is the distinction between operations the CPython eval
+loop handles on its own fast paths and those that go through
+`type.__call__` / `_PyObject_MakeTpCall` or out through libffi:
 
-Modules that die: `test_greenlet` (the main suite), `test_throw`,
-`test_tracing`, `test_greenlet_trash` (all SIGKILL) and
-`test_extension_interface` (SIGSEGV, inside greenlet's C API test module).
+| dies | survives |
+| --- | --- |
+| `str(1)`, `int("1")`, `dict(a=1)`, `object()` | `len("abc")`, `"a"+"b"` |
+| `isinstance(x, T)` (`PyType_IsSubtype`) | `list(range(3))`, `sorted([3,1,2])` |
+| any `ctypes` call | a 1000-element list comprehension |
+| `unittest`'s `assertEqual` / `assertTrue` | bare `assert` |
+
+This is not a corner case. `isinstance()` after a `throw()` is enough, and that
+is ordinary code — the port's own first check phase died on exactly that, at
+`PyType_IsSubtype`, reporting nothing for any interpreter. The check is now
+structured so each behaviour runs in its own subprocess and one crash cannot
+hide the rest.
+
+Modules of greenlet's own suite that die: `test_greenlet` (the main suite),
+`test_throw`, `test_tracing`, `test_greenlet_trash` (SIGKILL) and
+`test_extension_interface` (SIGSEGV).
 
 Two further modules fail for reasons that are **not** greenlet's fault:
 `test_cpp` decodes subprocess output as UTF-8 when on z/OS it is EBCDIC, and
@@ -160,7 +175,11 @@ Things ruled out for the remaining crash, with evidence:
   Python at the point of failure and had not moved, with ~1 MB of headroom.
   Setting `STACK64` does not fix the crash.
 * **Not the clobber list.** Removing r6/r7 gives byte-identical behaviour.
-* **Not the guard.** The generated code around it is clean.
+* **Not the guard.** The generated code around it is clean, and sweeping the
+  guard from 2560 to 32768 bytes changes nothing.
+* **Not Python-frame depth.** CPython 3.11+ does not create a C frame per
+  Python call, which is why 64 levels of Python recursion between the switch
+  and the throw are harmless while a single `str(1)` is not.
 
 The failure is a SIGKILL with no CEEDUMP, which means it is not an LE abend.
 
