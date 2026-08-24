@@ -1,0 +1,15 @@
+log/
+log.DEV/
+log.STABLE/
+build/
+install/
+.zoslib_hooks/
+
+# Ignore source directories created by zopen-build
+psutil-*/
+psutil/
+wheels/
+dist/
+
+# Source directory created by zopen-build
+greenlet/
